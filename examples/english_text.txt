@@ -1,0 +1,10 @@
+The DEFLATE compressed data format is an algorithm developed by Phil Katz and
+described in RFC 1951. It is a combination of the LZ77 algorithm and Huffman
+coding. LZ77 works by finding repeated sequences in the input data and
+replacing subsequent occurrences with a reference back to the first occurrence.
+The reference is a (length, distance) pair indicating how far back to look and
+how many bytes to copy. Huffman coding then encodes the resulting symbols
+(literals, lengths, and distances) using variable-length codes, assigning
+shorter codes to more frequent symbols. The result is a highly effective
+general-purpose compression algorithm used in ZIP, gzip, PNG, and many other
+formats.
