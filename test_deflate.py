@@ -3,10 +3,24 @@
 test_deflate.py — run a DEFLATE compressor against the reference examples.
 
 Usage:
-    python3 test_deflate.py <executable> [--file <name>]
+    python3 test_deflate.py <executable> [--file <name>] [--strict]
 
 The executable is invoked with the input file piped to stdin.  It must write
 raw DEFLATE (RFC 1951) bytes to stdout and exit 0 on success.
+
+Default mode (round-trip):
+    Decompresses the output with Python's zlib and checks it matches the
+    original input.  This is the correct test for a compressor — DEFLATE
+    does not mandate a unique compressed form, so any valid encoding of the
+    same bytes is a correct answer.
+
+Strict mode (--strict):
+    Also requires the compressed output to be bit-for-bit identical to the
+    reference .deflate files (which were produced by zlib at level 6).
+    Useful only if you are deliberately trying to replicate zlib's exact
+    choices (block type, Huffman tree construction, LZ77 match selection).
+    Your implementation will almost certainly not pass this without
+    specifically targeting zlib compatibility.
 
 Each run creates a timestamped directory under runs/ containing the compressed
 output and stderr (if any) for every tested example, plus a summary.txt.
@@ -16,13 +30,14 @@ import argparse
 import os
 import subprocess
 import sys
+import zlib
 from datetime import datetime
 from pathlib import Path
 
 
-REPO_ROOT   = Path(__file__).resolve().parent
+REPO_ROOT    = Path(__file__).resolve().parent
 EXAMPLES_DIR = REPO_ROOT / "examples"
-RUNS_DIR    = REPO_ROOT / "runs"
+RUNS_DIR     = REPO_ROOT / "runs"
 
 
 def find_examples() -> list[tuple[Path, Path]]:
@@ -36,10 +51,11 @@ def find_examples() -> list[tuple[Path, Path]]:
     return pairs
 
 
-def run_one(executable: str, input_path: Path, expected_path: Path, run_dir: Path) -> dict:
-    name = input_path.name
-    input_data  = input_path.read_bytes()
-    expected    = expected_path.read_bytes()
+def run_one(executable: str, input_path: Path, expected_path: Path,
+            run_dir: Path, strict: bool) -> dict:
+    name       = input_path.name
+    input_data = input_path.read_bytes()
+    expected   = expected_path.read_bytes()
 
     try:
         proc = subprocess.run(
@@ -68,11 +84,41 @@ def run_one(executable: str, input_path: Path, expected_path: Path, run_dir: Pat
         return _err(name, input_data, expected,
                     returncode=proc.returncode, first_error=first_err, actual=actual)
 
-    bit_match  = actual == expected
-    size_match = len(actual) == len(expected)
+    # Round-trip check: decompress with trusted zlib and compare to original.
+    try:
+        roundtripped = zlib.decompress(actual, wbits=-15)
+    except zlib.error as exc:
+        return {
+            "status":        "invalid",
+            "name":          name,
+            "input_size":    len(input_data),
+            "expected_size": len(expected),
+            "actual_size":   len(actual),
+            "returncode":    0,
+            "decomp_error":  str(exc),
+        }
+
+    if roundtripped != input_data:
+        return {
+            "status":        "roundtrip_mismatch",
+            "name":          name,
+            "input_size":    len(input_data),
+            "expected_size": len(expected),
+            "actual_size":   len(actual),
+            "returncode":    0,
+            "got_size":      len(roundtripped),
+        }
+
+    # In strict mode, also require bit-for-bit match with the reference file.
+    if strict:
+        bit_match  = actual == expected
+        size_match = len(actual) == len(expected)
+        status = "pass" if bit_match else ("size_mismatch" if not size_match else "bit_mismatch")
+    else:
+        status = "pass"
 
     return {
-        "status":        "pass" if bit_match else ("size_mismatch" if not size_match else "bit_mismatch"),
+        "status":        status,
         "name":          name,
         "input_size":    len(input_data),
         "expected_size": len(expected),
@@ -93,7 +139,7 @@ def _err(name, input_data, expected, *, returncode, first_error, actual) -> dict
     }
 
 
-def format_result(r: dict) -> str:
+def format_result(r: dict, strict: bool) -> str:
     name   = r["name"]
     in_sz  = r["input_size"]
     exp_sz = r["expected_size"]
@@ -102,18 +148,25 @@ def format_result(r: dict) -> str:
     match r["status"]:
         case "pass":
             ratio = act_sz / max(in_sz, 1) * 100
+            detail = "bit-for-bit match" if strict else "round-trip ok"
             return (f"  PASS  {name:<42} "
-                    f"{in_sz:>6} B → {act_sz:>6} B ({ratio:5.1f}%)  bit-for-bit match")
+                    f"{in_sz:>6} B → {act_sz:>6} B ({ratio:5.1f}%)  {detail}")
         case "error":
             rc  = r["returncode"]
             tag = f"exit={rc}" if rc is not None else "killed"
             return f" ERROR  {name:<42} {tag}  — {r['first_error']}"
+        case "invalid":
+            return (f"  FAIL  {name:<42} "
+                    f"output is not valid DEFLATE: {r['decomp_error']}")
+        case "roundtrip_mismatch":
+            return (f"  FAIL  {name:<42} "
+                    f"decompressed to {r['got_size']} B, expected {in_sz} B")
         case "size_mismatch":
             return (f"  FAIL  {name:<42} "
-                    f"size: expected {exp_sz} B, got {act_sz} B")
+                    f"[strict] size: expected {exp_sz} B, got {act_sz} B")
         case "bit_mismatch":
             return (f"  FAIL  {name:<42} "
-                    f"both {act_sz} B but content differs from reference")
+                    f"[strict] both {act_sz} B but content differs from reference")
         case _:
             return f"  ???   {name}"
 
@@ -121,15 +174,22 @@ def format_result(r: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Test a DEFLATE compressor against the reference examples.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "The executable is called with the input file on stdin.\n"
-            "It must write raw DEFLATE (RFC 1951) bytes to stdout and exit 0."
+            "Default: round-trip test (compress → decompress → compare to original).\n"
+            "Any valid DEFLATE encoding of the input bytes is accepted.\n\n"
+            "--strict: also require bit-for-bit match with the zlib level-6\n"
+            "reference files.  Almost no implementation will pass this."
         ),
     )
     parser.add_argument("executable", help="path to the DEFLATE compressor binary")
     parser.add_argument(
         "--file", metavar="NAME",
         help="test only this example (basename, e.g. hello.txt)",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="require bit-for-bit match with reference .deflate files",
     )
     args = parser.parse_args()
 
@@ -155,21 +215,23 @@ def main() -> None:
     run_dir   = RUNS_DIR / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    mode   = "strict (round-trip + bit-for-bit)" if args.strict else "round-trip"
     header = (
         f"Run:        {run_dir}\n"
         f"Executable: {executable}\n"
+        f"Mode:       {mode}\n"
         f"Examples:   {len(examples)}\n"
     )
     print(header)
 
     results = []
     for inp, exp in examples:
-        r = run_one(executable, inp, exp, run_dir)
+        r = run_one(executable, inp, exp, run_dir, strict=args.strict)
         results.append(r)
-        print(format_result(r))
+        print(format_result(r, strict=args.strict))
 
     n_pass = sum(1 for r in results if r["status"] == "pass")
-    n_fail = sum(1 for r in results if r["status"] in ("size_mismatch", "bit_mismatch"))
+    n_fail = sum(1 for r in results if r["status"] != "pass" and r["status"] != "error")
     n_err  = sum(1 for r in results if r["status"] == "error")
     footer = (
         f"\nResults: {n_pass} passed, {n_fail} failed, {n_err} errors"
@@ -178,7 +240,7 @@ def main() -> None:
     )
     print(footer)
 
-    summary = header + "\n".join(format_result(r) for r in results) + "\n" + footer + "\n"
+    summary = header + "\n".join(format_result(r, args.strict) for r in results) + "\n" + footer + "\n"
     (run_dir / "summary.txt").write_text(summary)
 
     if n_fail > 0 or n_err > 0:
