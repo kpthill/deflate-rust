@@ -1,7 +1,7 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{bail, ensure, Result};
 
 use crate::{
-    bitstream::BitIndex,
+    bitstream::Bitstream,
     huffman::{HuffmanTree, Symbol},
 };
 
@@ -13,29 +13,41 @@ pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
 
     let mut out = vec![];
 
-    let mut i = BitIndex::new();
+    let mut bs = Bitstream::new(bytes);
 
-    let header_bits = bytes[0] & 0x7;
+    let header_bits = bs.next_bits(3)?;
     ensure!(header_bits == 0x3); // assuming single-block, fixed-tree
-    i.advance(3);
 
     let tree = HuffmanTree::fixed_literal_len(); // (only, for now)
 
-    // TODO: could maybe move window logic into its own file
-
-    let (mut window, mut window_len) = bitstream::next_bits(bytes, &mut i, 16);
-
     loop {
-        let (symbol, len) = tree.next_symbol(window, window_len)?;
+        let (symbol, len) = tree.next_symbol(bs.peek())?;
+        bs.advance(len as isize)?;
 
-        window >>= len;
-        let (new_window_bits, bits_read) = bitstream::next_bits(bytes, &mut i, len);
-        window |= new_window_bits << (16 - len);
-        window_len -= len - bits_read;
+        dbg!(symbol);
 
         match symbol {
             Symbol::Literal(byte) => out.push(byte),
-            Symbol::Length { .. } => todo!("!"),
+            Symbol::Length { num_bits, base } => {
+                dbg!(bs.byte, bs.bit);
+
+                let addend = bs.next_bits(num_bits)?;
+                let length = base + addend;
+
+                // TODO: This won't work for dynamic trees
+                let (distance, _) = huffman::read_distance(bs.next_bits(5)?, 5)?;
+                let dist_extra_bits = bs.next_bits(distance.num_bits)?;
+
+                let dist: usize = (distance.base + dist_extra_bits).into();
+
+                ensure!(out.len() >= dist);
+                let mut read_idx = out.len() - dist;
+
+                for _ in 0..length {
+                    out.push(out[read_idx]);
+                    read_idx += 1;
+                }
+            }
             Symbol::EndOfBlock => return Ok(out),
             Symbol::Reserved => bail!("reserved symbol"),
         }
